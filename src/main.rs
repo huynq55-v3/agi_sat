@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 // ==========================================
 const MAX_VARS: usize = 300; // N
 const MAX_CLAUSES: usize = 2400; // M tối đa (8 * 300)
-const BATCH_SIZE: usize = 32;
-const HIDDEN_DIM: usize = 128;
+const BATCH_SIZE: usize = 128;
+const HIDDEN_DIM: usize = 64;
 const MP_STEPS: usize = 8; // Số vòng Message Passing (Lan truyền tín hiệu)
 
 // ==========================================
@@ -399,9 +399,7 @@ fn main() {
     let mut model = BipartiteSatModel::<MyBackend>::new(&device);
     let mut optim = AdamConfig::new().init();
 
-    // Khởi tạo Loss function (đã thay bằng masked_bce_loss custom)
-
-    // Tạo Channel Buffer 5 Batches (CPU gen chạy trước, GPU chỉ việc húp)
+    // Tạo Channel Buffer
     let (tx, rx) = sync_channel::<SatBatchData>(5);
 
     // Bắn Thread Data Generator
@@ -410,92 +408,123 @@ fn main() {
         run_data_worker(tx);
     });
 
-    // TẠO BỘ ĐỀ THI CHUẨN 100 CÂU CỐ ĐỊNH
     println!("🧪 Đang khởi tạo bộ đề thi chuẩn 100 câu...");
     let val_set = generate_fixed_validation_set(100);
 
+    // ====================================================================
+    // 🛠️ FIX 1: DI DỜI TENSOR VALIDATION RA NGOÀI VÒNG LẶP (DÙNG PURE WGPU)
+    // ====================================================================
+    // Khởi tạo đúng 1 lần, sống vĩnh viễn trên VRAM, RAM phẳng lỳ!
+    println!("📦 Đang tải bộ đề thi lên VRAM (1 lần duy nhất)...");
+    let val_incidence_tensor =
+        Tensor::<Wgpu, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
+            .reshape(Shape::new([100, MAX_CLAUSES, MAX_VARS]));
+
+    let val_var_mask = Tensor::<Wgpu, 1>::from_floats(val_set.var_mask.as_slice(), &device)
+        .reshape(Shape::new([100, MAX_VARS]));
+
+    let val_clause_mask = Tensor::<Wgpu, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
+        .reshape(Shape::new([100, MAX_CLAUSES]));
+
     let mut iteration = 0;
     let start_time = Instant::now();
-
-    println!("🔥 Bắt đầu Train loop (Train xong vứt)...");
-
-    // set time per test
     let time_per_test = Duration::from_millis(10);
+
+    println!("🔥 Bắt đầu Train loop...");
 
     loop {
         iteration += 1;
+        let is_log_step = iteration % 10 == 0;
 
-        // 1. Kéo data từ Channel (Chớp mắt)
-        let batch_data = rx.recv().unwrap();
+        // ====================================================================
+        // 🛡️ BƯỚC 1: ÉP HỦY BATCH DATA NGAY LẬP TỨC ĐỂ XẢ RAM CPU
+        // ====================================================================
+        let incidence_tensor;
+        let target_tensor;
+        let var_mask_tensor;
+        let clause_mask_tensor;
+        {
+            // Nhận data trong block này
+            let batch_data = rx.recv().unwrap();
 
-        // 2. Chuyển lên VRAM (GPU)
-        let incidence_tensor =
-            Tensor::<MyBackend, 1>::from_floats(batch_data.incidence_matrix.as_slice(), &device)
-                .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES, MAX_VARS]));
-
-        let target_tensor =
-            Tensor::<MyBackend, 1>::from_floats(batch_data.targets.as_slice(), &device)
-                .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
-
-        let var_mask_tensor =
-            Tensor::<MyBackend, 1>::from_floats(batch_data.var_mask.as_slice(), &device)
-                .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
-        let clause_mask_tensor =
-            Tensor::<MyBackend, 1>::from_floats(batch_data.clause_mask.as_slice(), &device)
-                .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES]));
+            // Đẩy sang GPU
+            incidence_tensor = Tensor::<MyBackend, 1>::from_floats(
+                batch_data.incidence_matrix.as_slice(),
+                &device,
+            )
+            .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES, MAX_VARS]));
+            target_tensor =
+                Tensor::<MyBackend, 1>::from_floats(batch_data.targets.as_slice(), &device)
+                    .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
+            var_mask_tensor =
+                Tensor::<MyBackend, 1>::from_floats(batch_data.var_mask.as_slice(), &device)
+                    .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
+            clause_mask_tensor =
+                Tensor::<MyBackend, 1>::from_floats(batch_data.clause_mask.as_slice(), &device)
+                    .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES]));
+        } // DẤU NGOẶC NÀY CỰC KỲ QUAN TRỌNG: batch_data BỊ TIÊU DIỆT TẠI ĐÂY! Trả lại ngay 100MB cho RAM!
 
         // 3. Forward Pass
         let logits = model.forward(
-            incidence_tensor.clone(),
+            incidence_tensor,
             var_mask_tensor.clone(),
-            clause_mask_tensor.clone(),
+            clause_mask_tensor,
         );
         let loss = masked_bce_loss(logits, target_tensor, var_mask_tensor);
 
-        // 4. Backward Pass & Update Trọng số
+        let loss_val: f32 = if is_log_step {
+            loss.clone().into_data().value[0]
+        } else {
+            0.0
+        };
+
+        // 4. Backward Pass & Update
         let grads = loss.backward();
         let grads = GradientsParams::from_grads(grads, &model);
-        model = optim.step(1e-3, model, grads);
+        model = optim.step(1e-2, model, grads);
 
-        // Force synchronization of lazy operations to prevent memory leak!
-        MyBackend::sync(&device);
+        MyBackend::sync(&device); // Dọn dẹp VRAM Graph Train
 
         // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH
-        if iteration % 10 == 0 {
-            let loss_val = loss.into_data().value[0];
+        if is_log_step {
+            // ====================================================================
+            // 🛡️ BƯỚC 2: ÉP HỦY TENSOR VALIDATION TRƯỚC KHI CHẠY VÒNG LẶP CPU
+            // ====================================================================
+            let val_probs_vec: Vec<f32>; // Chỉ giữ lại mảng số thực thuần túy
 
-            // 1. Khởi tạo Tensor ngay trong này để nó tự hủy (Drop) khi hết khối if
-            let val_incidence_tensor =
-                Tensor::<Wgpu, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
-                    .reshape(Shape::new([100, MAX_CLAUSES, MAX_VARS]));
+            {
+                let test_model = model.valid(); // Bóc tách Autodiff
 
-            let val_var_mask = Tensor::<Wgpu, 1>::from_floats(val_set.var_mask.as_slice(), &device)
-                .reshape(Shape::new([100, MAX_VARS]));
+                // Forward 100 bài
+                let val_logits = test_model.forward(
+                    val_incidence_tensor.clone(),
+                    val_var_mask.clone(),
+                    val_clause_mask.clone(),
+                );
 
-            let val_clause_mask =
-                Tensor::<Wgpu, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
-                    .reshape(Shape::new([100, MAX_CLAUSES]));
+                // Ép về CPU
+                let val_probs = sigmoid(val_logits).into_data();
 
-            let test_model = model.valid();
+                // Trích xuất lấy cái mảng Vec<f32> lõi bên trong
+                val_probs_vec = val_probs.value;
 
+                <Wgpu as Backend>::sync(&device);
+            } // DẤU NGOẶC NÀY CHÉM BAY MỌI TENSOR TRUNG GIAN! 
+            // VRAM và Shared RAM được giải phóng hoàn toàn TRƯỚC khi CPU bắt đầu cày 1 giây!
+
+            // ====================================================================
+            // BƯỚC 3: CPU CHẠY ĐỘC LẬP (Lúc này RAM đã cực kỳ nhẹ)
+            // ====================================================================
             let mut solved_count = 0;
             let mut total_attempts = 0;
             let num_tests = 100;
 
             for b in 0..num_tests {
-                // Cắt Tensor (vẫn giữ nguyên Backend MyBackend)
-                let inc_chunk =
-                    val_incidence_tensor
-                        .clone()
-                        .slice([b..b + 1, 0..MAX_CLAUSES, 0..MAX_VARS]);
-                let var_mask_chunk = val_var_mask.clone().slice([b..b + 1, 0..MAX_VARS]);
-                let clause_mask_chunk = val_clause_mask.clone().slice([b..b + 1, 0..MAX_CLAUSES]);
+                let start_idx = b * MAX_VARS;
+                let end_idx = start_idx + MAX_VARS;
 
-                // Forward pass trực tiếp
-                let val_logits = test_model.forward(inc_chunk, var_mask_chunk, clause_mask_chunk);
-                let val_probs = sigmoid(val_logits).into_data();
-
-                let spectrum_slice = &val_probs.value[0..MAX_VARS];
+                // Lấy data từ cái mảng thuần túy, không dính dáng gì đến Burn/GPU nữa
+                let spectrum_slice = &val_probs_vec[start_idx..end_idx];
 
                 let start_idx_inc = b * (MAX_CLAUSES * MAX_VARS);
                 let end_idx_inc = start_idx_inc + (MAX_CLAUSES * MAX_VARS);
