@@ -325,30 +325,27 @@ fn main() {
         let grads = GradientsParams::from_grads(grads, &model);
         model = optim.step(1e-3, model, grads);
 
-        // 5. Validation (Cứ mỗi 50 Iterations check 1 phát)
+        // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH (Cứ mỗi 50 Iterations)
         if iteration % 50 == 0 {
             let loss_val = loss.into_data().value[0];
 
-            // Kéo toàn bộ tensor phổ của cả 32 bài toán về CPU
-            let probs = sigmoid(logits).into_data();
+            // Forward pass lấy phổ trên bộ đề 100 câu
+            let val_logits = model.forward(val_incidence_tensor.clone());
+            let val_probs = sigmoid(val_logits).into_data();
 
             let mut solved_count = 0;
             let mut total_attempts = 0;
-            let num_tests = BATCH_SIZE; // Test toàn bộ 32 bài trong mẻ này
+            let num_tests = 100;
 
-            // Duyệt qua từng bài toán trong Batch
             for b in 0..num_tests {
-                // Cắt lấy phổ của đúng bài toán thứ b
                 let start_idx_var = b * MAX_VARS;
                 let end_idx_var = start_idx_var + MAX_VARS;
-                let spectrum_slice = &probs.value[start_idx_var..end_idx_var];
+                let spectrum_slice = &val_probs.value[start_idx_var..end_idx_var];
 
-                // Cắt lấy cấu trúc ngoặc (incidence matrix) của bài toán thứ b
                 let start_idx_inc = b * (MAX_CLAUSES * MAX_VARS);
                 let end_idx_inc = start_idx_inc + (MAX_CLAUSES * MAX_VARS);
-                let incidence_slice = &batch_data.incidence_matrix[start_idx_inc..end_idx_inc];
+                let incidence_slice = &val_set.incidence_matrix[start_idx_inc..end_idx_inc];
 
-                // Thả chó đi săn! (10ms limit)
                 let (is_success, attempts_made) = verify_spectrum_time_bound(
                     spectrum_slice,
                     incidence_slice,
@@ -361,12 +358,11 @@ fn main() {
                 total_attempts += attempts_made;
             }
 
-            // Tính toán thống kê
             let success_rate = (solved_count as f32 / num_tests as f32) * 100.0;
             let avg_attempts = total_attempts / num_tests as u32;
 
             println!(
-                "Iter: {:04} | Loss: {:.4} | Success Rate: {:>5.1}% ({}/{}) | Avg Attempts/{}ms: {} | Total Time: {}s",
+                "Iter: {:04} | Train Loss: {:.4} | Val Success: {:>5.1}% ({}/{}) | Avg Attempts/{}ms: {} | Total Time: {}s",
                 iteration,
                 loss_val,
                 success_rate,
