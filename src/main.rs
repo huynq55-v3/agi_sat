@@ -1,8 +1,7 @@
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
-use burn::module::Module;
-
 use burn::module::Param;
+use burn::module::{AutodiffModule, Module};
 use burn::nn::{LayerNorm, LayerNormConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
@@ -414,9 +413,6 @@ fn main() {
     // TẠO BỘ ĐỀ THI CHUẨN 100 CÂU CỐ ĐỊNH
     println!("🧪 Đang khởi tạo bộ đề thi chuẩn 100 câu...");
     let val_set = generate_fixed_validation_set(100);
-    let val_incidence_tensor =
-        Tensor::<MyBackend, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
-            .reshape(Shape::new([100, MAX_CLAUSES, MAX_VARS]));
 
     let mut iteration = 0;
     let start_time = Instant::now();
@@ -461,24 +457,26 @@ fn main() {
         let grads = GradientsParams::from_grads(grads, &model);
         model = optim.step(1e-3, model, grads);
 
-        // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH (Ông nên để lại 50 cho đỡ mất thời gian nhé)
-        if iteration % 50 == 0 {
+        // Force synchronization of lazy operations to prevent memory leak!
+        MyBackend::sync(&device);
+
+        // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH
+        if iteration % 10 == 0 {
             let loss_val = loss.into_data().value[0];
 
             // 1. Khởi tạo Tensor ngay trong này để nó tự hủy (Drop) khi hết khối if
             let val_incidence_tensor =
-                Tensor::<MyBackend, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
+                Tensor::<Wgpu, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
                     .reshape(Shape::new([100, MAX_CLAUSES, MAX_VARS]));
 
-            let val_var_mask =
-                Tensor::<MyBackend, 1>::from_floats(val_set.var_mask.as_slice(), &device)
-                    .reshape(Shape::new([100, MAX_VARS]));
+            let val_var_mask = Tensor::<Wgpu, 1>::from_floats(val_set.var_mask.as_slice(), &device)
+                .reshape(Shape::new([100, MAX_VARS]));
 
             let val_clause_mask =
-                Tensor::<MyBackend, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
+                Tensor::<Wgpu, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
                     .reshape(Shape::new([100, MAX_CLAUSES]));
 
-            let test_model = model.clone();
+            let test_model = model.valid();
 
             let mut solved_count = 0;
             let mut total_attempts = 0;
