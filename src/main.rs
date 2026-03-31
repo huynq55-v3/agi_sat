@@ -2,10 +2,10 @@ use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
 
+use burn::module::Param;
 use burn::nn::{LayerNorm, LayerNormConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::module::Param;
 use burn::tensor::Distribution;
 use burn::tensor::activation::relu;
 use burn::tensor::activation::sigmoid;
@@ -54,8 +54,12 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
             let n = rng.gen_range(100..=MAX_VARS);
             let m = rng.gen_range(n..=std::cmp::min(8 * n, MAX_CLAUSES));
 
-            for i in 0..n { batch_var_mask[b * MAX_VARS + i] = 1.0; }
-            for j in 0..m { batch_clause_mask[b * MAX_CLAUSES + j] = 1.0; }
+            for i in 0..n {
+                batch_var_mask[b * MAX_VARS + i] = 1.0;
+            }
+            for j in 0..m {
+                batch_clause_mask[b * MAX_CLAUSES + j] = 1.0;
+            }
 
             // Planted Solution
             let solution: Vec<bool> = (0..n).map(|_| rng.gen_bool(0.5)).collect();
@@ -141,8 +145,16 @@ pub struct BipartiteSatModel<B: Backend> {
 impl<B: Backend> BipartiteSatModel<B> {
     pub fn new(device: &B::Device) -> Self {
         Self {
-            var_init: Param::from_tensor(Tensor::random([HIDDEN_DIM], Distribution::Normal(0.0, 0.1), device)),
-            clause_init: Param::from_tensor(Tensor::random([HIDDEN_DIM], Distribution::Normal(0.0, 0.1), device)),
+            var_init: Param::from_tensor(Tensor::random(
+                [HIDDEN_DIM],
+                Distribution::Normal(0.0, 0.1),
+                device,
+            )),
+            clause_init: Param::from_tensor(Tensor::random(
+                [HIDDEN_DIM],
+                Distribution::Normal(0.0, 0.1),
+                device,
+            )),
 
             msg_var_to_pos: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
             msg_var_to_neg: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
@@ -167,8 +179,12 @@ impl<B: Backend> BipartiteSatModel<B> {
     ) -> Tensor<B, 2> {
         let batch_size = incidence.dims()[0];
 
-        let var_mask_3d = var_mask.clone().reshape(Shape::new([batch_size, MAX_VARS, 1]));
-        let clause_mask_3d = clause_mask.clone().reshape(Shape::new([batch_size, MAX_CLAUSES, 1]));
+        let var_mask_3d = var_mask
+            .clone()
+            .reshape(Shape::new([batch_size, MAX_VARS, 1]));
+        let clause_mask_3d = clause_mask
+            .clone()
+            .reshape(Shape::new([batch_size, MAX_CLAUSES, 1]));
 
         // 1. Khởi tạo TRÍ NHỚ (Memory) cho cả Biến và Ngoặc
         let zeros_v =
@@ -176,8 +192,14 @@ impl<B: Backend> BipartiteSatModel<B> {
         let zeros_c =
             Tensor::<B, 3>::zeros([batch_size, MAX_CLAUSES, HIDDEN_DIM], &incidence.device());
 
-        let mut var_emb = (zeros_v + self.var_init.val().reshape(Shape::new([1, 1, HIDDEN_DIM]))) * var_mask_3d.clone();
-        let mut clause_emb = (zeros_c + self.clause_init.val().reshape(Shape::new([1, 1, HIDDEN_DIM]))) * clause_mask_3d.clone();
+        let mut var_emb = (zeros_v + self.var_init.val().reshape(Shape::new([1, 1, HIDDEN_DIM])))
+            * var_mask_3d.clone();
+        let mut clause_emb = (zeros_c
+            + self
+                .clause_init
+                .val()
+                .reshape(Shape::new([1, 1, HIDDEN_DIM])))
+            * clause_mask_3d.clone();
 
         // 2. Tách ma trận Kép: Nhận diện chính xác 100% Khẳng định và Phủ định
         let pos_mask = relu(incidence.clone()); // Chỉ giữ +1.0
@@ -201,7 +223,8 @@ impl<B: Backend> BipartiteSatModel<B> {
 
             // Cập nhật trí nhớ của Ngoặc (Dùng Residual Connection `+ clause_emb`)
             let clause_update = relu(self.clause_mlp.forward(clause_signals));
-            clause_emb = self.clause_norm.forward(clause_emb + clause_update) * clause_mask_3d.clone();
+            clause_emb =
+                self.clause_norm.forward(clause_emb + clause_update) * clause_mask_3d.clone();
 
             // ==========================================
             // BƯỚC B: NGOẶC phản hồi lại BIẾN
@@ -299,8 +322,12 @@ fn generate_fixed_validation_set(num_samples: usize) -> SatBatchData {
         let n = rng.gen_range(100..=MAX_VARS);
         let m = rng.gen_range(n..=std::cmp::min(8 * n, MAX_CLAUSES));
 
-        for i in 0..n { batch_var_mask[b * MAX_VARS + i] = 1.0; }
-        for j in 0..m { batch_clause_mask[b * MAX_CLAUSES + j] = 1.0; }
+        for i in 0..n {
+            batch_var_mask[b * MAX_VARS + i] = 1.0;
+        }
+        for j in 0..m {
+            batch_clause_mask[b * MAX_CLAUSES + j] = 1.0;
+        }
         let solution: Vec<bool> = (0..n).map(|_| rng.gen_bool(0.5)).collect();
 
         for i in 0..n {
@@ -355,13 +382,13 @@ fn masked_bce_loss<B: Backend>(
     let probs = burn::tensor::activation::sigmoid(logits);
     let eps = 1e-7;
     let p_safe = probs.clamp_min(eps).clamp_max(1.0 - eps);
-    
+
     let term1 = targets.clone() * p_safe.clone().log();
     let term2 = (targets.neg() + 1.0) * (p_safe.neg() + 1.0).log();
     let loss_elements = (term1 + term2).neg();
 
     let masked_loss = loss_elements * mask.clone();
-    
+
     masked_loss.sum() / mask.sum().clamp_min(1.0)
 }
 
@@ -414,13 +441,19 @@ fn main() {
             Tensor::<MyBackend, 1>::from_floats(batch_data.targets.as_slice(), &device)
                 .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
 
-        let var_mask_tensor = Tensor::<MyBackend, 1>::from_floats(batch_data.var_mask.as_slice(), &device)
-            .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
-        let clause_mask_tensor = Tensor::<MyBackend, 1>::from_floats(batch_data.clause_mask.as_slice(), &device)
-            .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES]));
+        let var_mask_tensor =
+            Tensor::<MyBackend, 1>::from_floats(batch_data.var_mask.as_slice(), &device)
+                .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
+        let clause_mask_tensor =
+            Tensor::<MyBackend, 1>::from_floats(batch_data.clause_mask.as_slice(), &device)
+                .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES]));
 
         // 3. Forward Pass
-        let logits = model.forward(incidence_tensor.clone(), var_mask_tensor.clone(), clause_mask_tensor.clone());
+        let logits = model.forward(
+            incidence_tensor.clone(),
+            var_mask_tensor.clone(),
+            clause_mask_tensor.clone(),
+        );
         let loss = masked_bce_loss(logits, target_tensor, var_mask_tensor);
 
         // 4. Backward Pass & Update Trọng số
@@ -429,27 +462,39 @@ fn main() {
         model = optim.step(1e-3, model, grads);
 
         // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH (Cứ mỗi 50 Iterations)
-        if iteration % 50 == 0 {
+        if iteration % 10 == 0 {
             let loss_val = loss.into_data().value[0];
 
-            let val_var_mask = Tensor::<MyBackend, 1>::from_floats(val_set.var_mask.as_slice(), &device)
-                .reshape(Shape::new([100, MAX_VARS]));
-            let val_clause_mask = Tensor::<MyBackend, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
-                .reshape(Shape::new([100, MAX_CLAUSES]));
-
-            // Forward pass lấy phổ trên bộ đề 100 câu
-            let val_logits = model.forward(val_incidence_tensor.clone(), val_var_mask, val_clause_mask);
-            let val_probs = sigmoid(val_logits).into_data();
+            let val_var_mask =
+                Tensor::<MyBackend, 1>::from_floats(val_set.var_mask.as_slice(), &device)
+                    .reshape(Shape::new([100, MAX_VARS]));
+            let val_clause_mask =
+                Tensor::<MyBackend, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
+                    .reshape(Shape::new([100, MAX_CLAUSES]));
 
             let mut solved_count = 0;
             let mut total_attempts = 0;
             let num_tests = 100;
 
+            // Chạy vòng lặp, đút TỪNG BÀI MỘT cho GPU để chống nổ VRAM
             for b in 0..num_tests {
-                let start_idx_var = b * MAX_VARS;
-                let end_idx_var = start_idx_var + MAX_VARS;
-                let spectrum_slice = &val_probs.value[start_idx_var..end_idx_var];
+                // 1. Cắt (Slice) đúng bài toán thứ b
+                // Cú pháp slice trong Burn: [start..end, dim2, dim3]
+                let inc_chunk =
+                    val_incidence_tensor
+                        .clone()
+                        .slice([b..b + 1, 0..MAX_CLAUSES, 0..MAX_VARS]);
+                let var_mask_chunk = val_var_mask.clone().slice([b..b + 1, 0..MAX_VARS]);
+                let clause_mask_chunk = val_clause_mask.clone().slice([b..b + 1, 0..MAX_CLAUSES]);
 
+                // 2. Forward pass trên ĐÚNG 1 BÀI (Cực nhẹ, ngốn chưa tới 10MB VRAM)
+                let val_logits = model.forward(inc_chunk, var_mask_chunk, clause_mask_chunk);
+                let val_probs = sigmoid(val_logits).into_data();
+
+                // 3. Vì chỉ có 1 bài, phổ lấy ra chắc chắn có đúng 300 phần tử
+                let spectrum_slice = &val_probs.value[0..MAX_VARS];
+
+                // 4. Lấy ma trận Incidence từ CPU để bộ Verifier check
                 let start_idx_inc = b * (MAX_CLAUSES * MAX_VARS);
                 let end_idx_inc = start_idx_inc + (MAX_CLAUSES * MAX_VARS);
                 let incidence_slice = &val_set.incidence_matrix[start_idx_inc..end_idx_inc];
