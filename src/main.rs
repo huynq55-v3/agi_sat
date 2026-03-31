@@ -2,6 +2,7 @@ use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
 use burn::nn::loss::BinaryCrossEntropyLossConfig;
+use burn::nn::{LayerNorm, LayerNormConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::relu;
@@ -102,48 +103,98 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
 }
 
 // ==========================================
-// 4. KIẾN TRÚC BURN MODEL (WGPU)
+// 4. KIẾN TRÚC BURN MODEL V2 (GNN CHUẨN MỰC)
 // ==========================================
 #[derive(Module, Debug)]
 pub struct BipartiteSatModel<B: Backend> {
+    // Các lớp chiếu (Projection) để phân tách Khẳng định/Phủ định
+    msg_var_to_pos: Linear<B>,
+    msg_var_to_neg: Linear<B>,
+    msg_clause_to_pos: Linear<B>,
+    msg_clause_to_neg: Linear<B>,
+
+    // Mạng MLP xử lý thông tin tại Node
     var_mlp: Linear<B>,
     clause_mlp: Linear<B>,
+
+    // Bộ chuẩn hóa (Tránh bệnh "đồng hóa" vector)
+    var_norm: LayerNorm<B>,
+    clause_norm: LayerNorm<B>,
+
     output_layer: Linear<B>,
 }
 
 impl<B: Backend> BipartiteSatModel<B> {
     pub fn new(device: &B::Device) -> Self {
         Self {
-            // SỬA Ở ĐÂY: Input của MLP là đặc trưng (HIDDEN_DIM), không phải số lượng biến/ngoặc
+            msg_var_to_pos: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
+            msg_var_to_neg: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
+            msg_clause_to_pos: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
+            msg_clause_to_neg: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
+
             var_mlp: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
             clause_mlp: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
+
+            var_norm: LayerNormConfig::new(HIDDEN_DIM).init(device),
+            clause_norm: LayerNormConfig::new(HIDDEN_DIM).init(device),
+
             output_layer: LinearConfig::new(HIDDEN_DIM, 1).init(device),
         }
     }
 
     pub fn forward(
         &self,
-        incidence: Tensor<B, 3>, // [Batch, M, N]
+        incidence: Tensor<B, 3>, // [Batch, M, N] chứa 1.0, -1.0, 0.0
     ) -> Tensor<B, 2> {
-        // Khởi tạo Embedding cơ bản (Tận dụng batch size)
         let batch_size = incidence.dims()[0];
+
+        // 1. Khởi tạo TRÍ NHỚ (Memory) cho cả Biến và Ngoặc
         let mut var_emb =
             Tensor::<B, 3>::zeros([batch_size, MAX_VARS, HIDDEN_DIM], &incidence.device());
+        let mut clause_emb =
+            Tensor::<B, 3>::zeros([batch_size, MAX_CLAUSES, HIDDEN_DIM], &incidence.device());
 
-        let incidence_t = incidence.clone().transpose(); // [Batch, N, M]
+        // 2. Tách ma trận Kép: Nhận diện chính xác 100% Khẳng định và Phủ định
+        let pos_mask = relu(incidence.clone()); // Chỉ giữ +1.0
+        let neg_mask = relu(incidence.clone().neg()); // Ép -1.0 thành +1.0 (relu của số dương)
 
-        // Message Passing Vòng lặp
+        let pos_mask_t = pos_mask.clone().transpose(); // [Batch, N, M]
+        let neg_mask_t = neg_mask.clone().transpose(); // [Batch, N, M]
+
+        // 3. Vòng lặp Lan truyền Đồ thị (Message Passing)
         for _ in 0..MP_STEPS {
-            // Bước 1: Biến -> Ngoặc (Nhân ma trận [B, M, N] x [B, N, D] -> [B, M, D])
-            let clause_signals = incidence.clone().matmul(var_emb.clone());
-            let clause_emb = relu(self.clause_mlp.forward(clause_signals));
+            // ==========================================
+            // BƯỚC A: BIẾN truyền tín hiệu đến NGOẶC
+            // ==========================================
+            // Biến "nói chuyện" theo 2 giọng khác nhau cho Khẳng định và Phủ định
+            let var_pos_msg = self.msg_var_to_pos.forward(var_emb.clone());
+            let var_neg_msg = self.msg_var_to_neg.forward(var_emb.clone());
 
-            // Bước 2: Ngoặc -> Biến (Nhân ma trận [B, N, M] x [B, M, D] -> [B, N, D])
-            let var_signals = incidence_t.clone().matmul(clause_emb);
-            var_emb = relu(self.var_mlp.forward(var_signals));
+            // Ngoặc tổng hợp tín hiệu (Chỉ cộng những chỗ có mặt)
+            let clause_signals =
+                pos_mask.clone().matmul(var_pos_msg) + neg_mask.clone().matmul(var_neg_msg);
+
+            // Cập nhật trí nhớ của Ngoặc (Dùng Residual Connection `+ clause_emb`)
+            let clause_update = relu(self.clause_mlp.forward(clause_signals));
+            clause_emb = self.clause_norm.forward(clause_emb + clause_update);
+
+            // ==========================================
+            // BƯỚC B: NGOẶC phản hồi lại BIẾN
+            // ==========================================
+            // Ngoặc cũng phản hồi lại theo 2 giọng
+            let clause_pos_msg = self.msg_clause_to_pos.forward(clause_emb.clone());
+            let clause_neg_msg = self.msg_clause_to_neg.forward(clause_emb.clone());
+
+            // Biến tổng hợp phản hồi
+            let var_signals = pos_mask_t.clone().matmul(clause_pos_msg)
+                + neg_mask_t.clone().matmul(clause_neg_msg);
+
+            // Cập nhật trí nhớ của Biến
+            let var_update = relu(self.var_mlp.forward(var_signals));
+            var_emb = self.var_norm.forward(var_emb + var_update);
         }
 
-        // Xuất phổ logits [Batch, N, 1] -> Bóp lại thành [Batch, N]
+        // 4. Xuất Phổ Logits
         let logits = self.output_layer.forward(var_emb).squeeze(2);
         logits
     }
