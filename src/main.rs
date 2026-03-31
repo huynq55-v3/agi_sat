@@ -461,25 +461,31 @@ fn main() {
         let grads = GradientsParams::from_grads(grads, &model);
         model = optim.step(1e-3, model, grads);
 
-        // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH (Cứ mỗi 50 Iterations)
-        if iteration % 10 == 0 {
+        // 5. TEST TRÊN BỘ ĐỀ CỐ ĐỊNH (Ông nên để lại 50 cho đỡ mất thời gian nhé)
+        if iteration % 50 == 0 {
             let loss_val = loss.into_data().value[0];
+
+            // 1. Khởi tạo Tensor ngay trong này để nó tự hủy (Drop) khi hết khối if
+            let val_incidence_tensor =
+                Tensor::<MyBackend, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
+                    .reshape(Shape::new([100, MAX_CLAUSES, MAX_VARS]));
 
             let val_var_mask =
                 Tensor::<MyBackend, 1>::from_floats(val_set.var_mask.as_slice(), &device)
                     .reshape(Shape::new([100, MAX_VARS]));
+
             let val_clause_mask =
                 Tensor::<MyBackend, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
                     .reshape(Shape::new([100, MAX_CLAUSES]));
+
+            let test_model = model.clone();
 
             let mut solved_count = 0;
             let mut total_attempts = 0;
             let num_tests = 100;
 
-            // Chạy vòng lặp, đút TỪNG BÀI MỘT cho GPU để chống nổ VRAM
             for b in 0..num_tests {
-                // 1. Cắt (Slice) đúng bài toán thứ b
-                // Cú pháp slice trong Burn: [start..end, dim2, dim3]
+                // Cắt Tensor (vẫn giữ nguyên Backend MyBackend)
                 let inc_chunk =
                     val_incidence_tensor
                         .clone()
@@ -487,14 +493,12 @@ fn main() {
                 let var_mask_chunk = val_var_mask.clone().slice([b..b + 1, 0..MAX_VARS]);
                 let clause_mask_chunk = val_clause_mask.clone().slice([b..b + 1, 0..MAX_CLAUSES]);
 
-                // 2. Forward pass trên ĐÚNG 1 BÀI (Cực nhẹ, ngốn chưa tới 10MB VRAM)
-                let val_logits = model.forward(inc_chunk, var_mask_chunk, clause_mask_chunk);
+                // Forward pass trực tiếp
+                let val_logits = test_model.forward(inc_chunk, var_mask_chunk, clause_mask_chunk);
                 let val_probs = sigmoid(val_logits).into_data();
 
-                // 3. Vì chỉ có 1 bài, phổ lấy ra chắc chắn có đúng 300 phần tử
                 let spectrum_slice = &val_probs.value[0..MAX_VARS];
 
-                // 4. Lấy ma trận Incidence từ CPU để bộ Verifier check
                 let start_idx_inc = b * (MAX_CLAUSES * MAX_VARS);
                 let end_idx_inc = start_idx_inc + (MAX_CLAUSES * MAX_VARS);
                 let incidence_slice = &val_set.incidence_matrix[start_idx_inc..end_idx_inc];
