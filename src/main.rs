@@ -1,25 +1,26 @@
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
+use burn::nn::loss::BinaryCrossEntropyLossConfig;
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::activation::{relu, sigmoid};
-use burn::tensor::loss::binary_cross_entropy_with_logits;
-use burn::tensor::{backend::Backend, Shape, Tensor};
-use burn::optim::{AdamConfig, Optimizer};
+use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::tensor::activation::relu;
+use burn::tensor::activation::sigmoid;
+use burn::tensor::{Shape, Tensor, backend::Backend};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use std::sync::mpsc::{sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::thread;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 // ==========================================
 // 1. CẤU HÌNH HỆ THỐNG "THỊT ĐÈ NGƯỜI"
 // ==========================================
-const MAX_VARS: usize = 300;     // N
+const MAX_VARS: usize = 300; // N
 const MAX_CLAUSES: usize = 2400; // M tối đa (8 * 300)
 const BATCH_SIZE: usize = 32;
 const HIDDEN_DIM: usize = 128;
-const MP_STEPS: usize = 3;       // Số vòng Message Passing (Lan truyền tín hiệu)
+const MP_STEPS: usize = 3; // Số vòng Message Passing (Lan truyền tín hiệu)
 
 // ==========================================
 // 2. DATA STRUCTURES
@@ -27,7 +28,7 @@ const MP_STEPS: usize = 3;       // Số vòng Message Passing (Lan truyền tí
 pub struct SatBatchData {
     // Ma trận liên thuộc [BATCH, MAX_CLAUSES, MAX_VARS]
     // 1.0 = Khẳng định, -1.0 = Phủ định, 0.0 = Không tham gia
-    pub incidence_matrix: Vec<f32>, 
+    pub incidence_matrix: Vec<f32>,
     // Nhãn [BATCH, MAX_VARS]
     pub targets: Vec<f32>,
 }
@@ -66,7 +67,9 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
                     let sign = rng.gen_bool(0.5);
                     clause_vars.push(v);
                     clause_signs.push(sign);
-                    if solution[v] == sign { is_satisfied = true; }
+                    if solution[v] == sign {
+                        is_satisfied = true;
+                    }
                 }
 
                 // Cứu ngoặc nếu sai toàn tập
@@ -86,7 +89,13 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
         }
 
         // Đẩy batch vào channel. Nếu GPU đang bận thì CPU sẽ block (chờ).
-        if tx.send(SatBatchData { incidence_matrix: batch_incidence, targets: batch_targets }).is_err() {
+        if tx
+            .send(SatBatchData {
+                incidence_matrix: batch_incidence,
+                targets: batch_targets,
+            })
+            .is_err()
+        {
             break; // Main thread đã chết -> Thoát worker
         }
     }
@@ -112,13 +121,15 @@ impl<B: Backend> BipartiteSatModel<B> {
     }
 
     pub fn forward(
-        &self, 
+        &self,
         incidence: Tensor<B, 3>, // [Batch, M, N]
-    ) -> Tensor<B, 2> { // Trả về [Batch, N] (Logits)
-        
+    ) -> Tensor<B, 2> {
+        // Trả về [Batch, N] (Logits)
+
         // Khởi tạo Embedding cơ bản (Tận dụng batch size)
         let batch_size = incidence.dims()[0];
-        let mut var_emb = Tensor::<B, 3>::zeros([batch_size, MAX_VARS, HIDDEN_DIM], &incidence.device());
+        let mut var_emb =
+            Tensor::<B, 3>::zeros([batch_size, MAX_VARS, HIDDEN_DIM], &incidence.device());
 
         let incidence_t = incidence.clone().transpose(); // [Batch, N, M]
 
@@ -143,17 +154,21 @@ impl<B: Backend> BipartiteSatModel<B> {
 // 5. VALIDATOR SIÊU TỐC (1ms/10k MẪU TRÊN CPU)
 // ==========================================
 // Trả về tuple: (Có tìm thấy nghiệm không?, Số mẫu đã check được trong thời gian đó)
-fn verify_spectrum_time_bound(spectrum: &[f32], incidence_flat: &[f32], time_limit_ms: u64) -> (bool, u32) {
+fn verify_spectrum_time_bound(
+    spectrum: &[f32],
+    incidence_flat: &[f32],
+    time_limit_ms: u64,
+) -> (bool, u32) {
     let mut rng = SmallRng::from_entropy();
     let start_time = Instant::now();
     let time_limit = Duration::from_millis(time_limit_ms);
-    
+
     let mut attempts = 0;
 
     loop {
         attempts += 1;
         let mut sample = [false; MAX_VARS];
-        
+
         // 1. Gen mẫu dựa trên phổ
         for i in 0..MAX_VARS {
             sample[i] = rng.gen_bool(spectrum[i] as f64);
@@ -171,7 +186,7 @@ fn verify_spectrum_time_bound(spectrum: &[f32], incidence_flat: &[f32], time_lim
                     clause_has_vars = true;
                     if (sign > 0.0 && sample[v]) || (sign < 0.0 && !sample[v]) {
                         clause_sat = true;
-                        break; 
+                        break;
                     }
                 }
             }
@@ -182,7 +197,7 @@ fn verify_spectrum_time_bound(spectrum: &[f32], incidence_flat: &[f32], time_lim
             }
         }
 
-        if all_clauses_sat { 
+        if all_clauses_sat {
             return (true, attempts); // Tìm thấy nghiệm sớm!
         }
 
@@ -194,7 +209,7 @@ fn verify_spectrum_time_bound(spectrum: &[f32], incidence_flat: &[f32], time_lim
             }
         }
     }
-    
+
     (false, attempts) // Trả về false và báo cáo xem trong 1ms đã "băm" được bao nhiêu mẫu
 }
 
@@ -207,7 +222,12 @@ fn main() {
 
     // Khởi tạo Model & Optimizer
     let mut model = BipartiteSatModel::<MyBackend>::new(&device);
-    let mut optim = AdamConfig::new().with_learning_rate(1e-3).init();
+    let mut optim = AdamConfig::new().init();
+
+    // Khởi tạo Loss function
+    let bce_loss = BinaryCrossEntropyLossConfig::new()
+        .with_logits(true)
+        .init(&device);
 
     // Tạo Channel Buffer 5 Batches (CPU gen chạy trước, GPU chỉ việc húp)
     let (tx, rx) = sync_channel::<SatBatchData>(5);
@@ -223,6 +243,9 @@ fn main() {
 
     println!("🔥 Bắt đầu Train loop (Train xong vứt)...");
 
+    // set valid time
+    let valid_time = Duration::from_millis(10);
+
     loop {
         iteration += 1;
 
@@ -230,38 +253,46 @@ fn main() {
         let batch_data = rx.recv().unwrap();
 
         // 2. Chuyển lên VRAM (GPU)
-        let incidence_tensor = Tensor::<MyBackend, 1>::from_floats(batch_data.incidence_matrix.as_slice(), &device)
-            .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES, MAX_VARS]));
-        
-        let target_tensor = Tensor::<MyBackend, 1>::from_floats(batch_data.targets.as_slice(), &device)
-            .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
+        let incidence_tensor =
+            Tensor::<MyBackend, 1>::from_floats(batch_data.incidence_matrix.as_slice(), &device)
+                .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES, MAX_VARS]));
+
+        let target_tensor =
+            Tensor::<MyBackend, 1>::from_floats(batch_data.targets.as_slice(), &device)
+                .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
 
         // 3. Forward Pass
         let logits = model.forward(incidence_tensor.clone());
-        let loss = binary_cross_entropy_with_logits(logits.clone(), target_tensor);
+        let loss = bce_loss.forward(logits.clone(), target_tensor.int());
 
         // 4. Backward Pass & Update Trọng số
         let grads = loss.backward();
-        let grads = optim.step(1e-3, model.clone(), grads);
-        model = model.valid(); // Cập nhật model
+        let grads = GradientsParams::from_grads(grads, &model);
+        model = optim.step(1e-3, model, grads);
 
         // 5. Validation (Cứ mỗi 50 Iterations check tốc độ 1 phát)
         if iteration % 50 == 0 {
             let loss_val = loss.into_data().value[0];
-            
+
             // Lấy phổ xác suất của 1 sample trong batch bằng sigmoid
             let probs = sigmoid(logits).into_data();
             let spectrum_slice = &probs.value[0..MAX_VARS]; // Phổ biến 0 -> 300 của sample đầu tiên
-            
+
             // Trích cấu trúc ngoặc của sample đó để Verifier check
             let incidence_slice = &batch_data.incidence_matrix[0..(MAX_CLAUSES * MAX_VARS)];
-            
+
             // Giới hạn 1 mili-giây
-            let (is_success, attempts_made) = verify_spectrum_time_bound(spectrum_slice, incidence_slice, 1);
+            let (is_success, attempts_made) =
+                verify_spectrum_time_bound(spectrum_slice, incidence_slice, 1);
 
             println!(
-                "Iter: {:04} | Loss: {:.4} | Success: {} | Attempts in 1ms: {} | Total Time: {}s",
-                iteration, loss_val, if is_success {"✅"} else {"❌"}, attempts_made, start_time.elapsed().as_secs()
+                "Iter: {:04} | Loss: {:.4} | Success: {} | Attempts in {}ms: {} | Total Time: {}s",
+                iteration,
+                loss_val,
+                if is_success { "✅" } else { "❌" },
+                valid_time.as_millis(),
+                attempts_made,
+                start_time.elapsed().as_secs()
             );
         }
     }
