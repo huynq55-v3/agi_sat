@@ -114,8 +114,9 @@ pub struct BipartiteSatModel<B: Backend> {
 impl<B: Backend> BipartiteSatModel<B> {
     pub fn new(device: &B::Device) -> Self {
         Self {
-            var_mlp: LinearConfig::new(MAX_VARS, HIDDEN_DIM).init(device),
-            clause_mlp: LinearConfig::new(MAX_CLAUSES, HIDDEN_DIM).init(device),
+            // SỬA Ở ĐÂY: Input của MLP là đặc trưng (HIDDEN_DIM), không phải số lượng biến/ngoặc
+            var_mlp: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
+            clause_mlp: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
             output_layer: LinearConfig::new(HIDDEN_DIM, 1).init(device),
         }
     }
@@ -124,8 +125,6 @@ impl<B: Backend> BipartiteSatModel<B> {
         &self,
         incidence: Tensor<B, 3>, // [Batch, M, N]
     ) -> Tensor<B, 2> {
-        // Trả về [Batch, N] (Logits)
-
         // Khởi tạo Embedding cơ bản (Tận dụng batch size)
         let batch_size = incidence.dims()[0];
         let mut var_emb =
@@ -213,6 +212,55 @@ fn verify_spectrum_time_bound(
     (false, attempts) // Trả về false và báo cáo xem trong 1ms đã "băm" được bao nhiêu mẫu
 }
 
+fn generate_fixed_validation_set(num_samples: usize) -> SatBatchData {
+    let mut rng = SmallRng::from_entropy();
+    let mut batch_incidence = vec![0.0; num_samples * MAX_CLAUSES * MAX_VARS];
+    let mut batch_targets = vec![0.0; num_samples * MAX_VARS];
+
+    for b in 0..num_samples {
+        let n = rng.gen_range(100..=MAX_VARS);
+        let m = rng.gen_range(n..=std::cmp::min(8 * n, MAX_CLAUSES));
+        let solution: Vec<bool> = (0..n).map(|_| rng.gen_bool(0.5)).collect();
+
+        for i in 0..n {
+            batch_targets[b * MAX_VARS + i] = if solution[i] { 1.0 } else { 0.0 };
+        }
+
+        for clause_idx in 0..m {
+            let k = rng.gen_range(3..=15);
+            let mut is_satisfied = false;
+            let mut clause_vars = Vec::with_capacity(k);
+            let mut clause_signs = Vec::with_capacity(k);
+
+            for _ in 0..k {
+                let v = rng.gen_range(0..n);
+                let sign = rng.gen_bool(0.5);
+                clause_vars.push(v);
+                clause_signs.push(sign);
+                if solution[v] == sign {
+                    is_satisfied = true;
+                }
+            }
+
+            if !is_satisfied {
+                let lucky = rng.gen_range(0..k);
+                clause_signs[lucky] = !clause_signs[lucky];
+            }
+
+            for idx in 0..k {
+                let v = clause_vars[idx];
+                let sign_val = if clause_signs[idx] { 1.0 } else { -1.0 };
+                let flat_idx = b * (MAX_CLAUSES * MAX_VARS) + clause_idx * MAX_VARS + v;
+                batch_incidence[flat_idx] = sign_val;
+            }
+        }
+    }
+    SatBatchData {
+        incidence_matrix: batch_incidence,
+        targets: batch_targets,
+    }
+}
+
 // ==========================================
 // 6. MAIN LOOP: TRÁI TIM CỦA HỆ THỐNG
 // ==========================================
@@ -238,13 +286,20 @@ fn main() {
         run_data_worker(tx);
     });
 
+    // TẠO BỘ ĐỀ THI CHUẨN 100 CÂU CỐ ĐỊNH
+    println!("🧪 Đang khởi tạo bộ đề thi chuẩn 100 câu...");
+    let val_set = generate_fixed_validation_set(100);
+    let val_incidence_tensor =
+        Tensor::<MyBackend, 1>::from_floats(val_set.incidence_matrix.as_slice(), &device)
+            .reshape(Shape::new([100, MAX_CLAUSES, MAX_VARS]));
+
     let mut iteration = 0;
     let start_time = Instant::now();
 
     println!("🔥 Bắt đầu Train loop (Train xong vứt)...");
 
-    // set valid time
-    let valid_time = Duration::from_millis(10);
+    // set time per test
+    let time_per_test = Duration::from_millis(10);
 
     loop {
         iteration += 1;
@@ -270,28 +325,55 @@ fn main() {
         let grads = GradientsParams::from_grads(grads, &model);
         model = optim.step(1e-3, model, grads);
 
-        // 5. Validation (Cứ mỗi 50 Iterations check tốc độ 1 phát)
+        // 5. Validation (Cứ mỗi 50 Iterations check 1 phát)
         if iteration % 50 == 0 {
             let loss_val = loss.into_data().value[0];
 
-            // Lấy phổ xác suất của 1 sample trong batch bằng sigmoid
+            // Kéo toàn bộ tensor phổ của cả 32 bài toán về CPU
             let probs = sigmoid(logits).into_data();
-            let spectrum_slice = &probs.value[0..MAX_VARS]; // Phổ biến 0 -> 300 của sample đầu tiên
 
-            // Trích cấu trúc ngoặc của sample đó để Verifier check
-            let incidence_slice = &batch_data.incidence_matrix[0..(MAX_CLAUSES * MAX_VARS)];
+            let mut solved_count = 0;
+            let mut total_attempts = 0;
+            let num_tests = BATCH_SIZE; // Test toàn bộ 32 bài trong mẻ này
 
-            // Giới hạn 1 mili-giây
-            let (is_success, attempts_made) =
-                verify_spectrum_time_bound(spectrum_slice, incidence_slice, 1);
+            // Duyệt qua từng bài toán trong Batch
+            for b in 0..num_tests {
+                // Cắt lấy phổ của đúng bài toán thứ b
+                let start_idx_var = b * MAX_VARS;
+                let end_idx_var = start_idx_var + MAX_VARS;
+                let spectrum_slice = &probs.value[start_idx_var..end_idx_var];
+
+                // Cắt lấy cấu trúc ngoặc (incidence matrix) của bài toán thứ b
+                let start_idx_inc = b * (MAX_CLAUSES * MAX_VARS);
+                let end_idx_inc = start_idx_inc + (MAX_CLAUSES * MAX_VARS);
+                let incidence_slice = &batch_data.incidence_matrix[start_idx_inc..end_idx_inc];
+
+                // Thả chó đi săn! (10ms limit)
+                let (is_success, attempts_made) = verify_spectrum_time_bound(
+                    spectrum_slice,
+                    incidence_slice,
+                    time_per_test.as_millis() as u64,
+                );
+
+                if is_success {
+                    solved_count += 1;
+                }
+                total_attempts += attempts_made;
+            }
+
+            // Tính toán thống kê
+            let success_rate = (solved_count as f32 / num_tests as f32) * 100.0;
+            let avg_attempts = total_attempts / num_tests as u32;
 
             println!(
-                "Iter: {:04} | Loss: {:.4} | Success: {} | Attempts in {}ms: {} | Total Time: {}s",
+                "Iter: {:04} | Loss: {:.4} | Success Rate: {:>5.1}% ({}/{}) | Avg Attempts/{}ms: {} | Total Time: {}s",
                 iteration,
                 loss_val,
-                if is_success { "✅" } else { "❌" },
-                valid_time.as_millis(),
-                attempts_made,
+                success_rate,
+                solved_count,
+                num_tests,
+                time_per_test.as_millis(),
+                avg_attempts,
                 start_time.elapsed().as_secs()
             );
         }
