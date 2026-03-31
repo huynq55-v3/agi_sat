@@ -1,10 +1,12 @@
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
-use burn::nn::loss::BinaryCrossEntropyLossConfig;
+
 use burn::nn::{LayerNorm, LayerNormConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::module::Param;
+use burn::tensor::Distribution;
 use burn::tensor::activation::relu;
 use burn::tensor::activation::sigmoid;
 use burn::tensor::{Shape, Tensor, backend::Backend};
@@ -21,7 +23,7 @@ const MAX_VARS: usize = 300; // N
 const MAX_CLAUSES: usize = 2400; // M tối đa (8 * 300)
 const BATCH_SIZE: usize = 32;
 const HIDDEN_DIM: usize = 128;
-const MP_STEPS: usize = 3; // Số vòng Message Passing (Lan truyền tín hiệu)
+const MP_STEPS: usize = 8; // Số vòng Message Passing (Lan truyền tín hiệu)
 
 // ==========================================
 // 2. DATA STRUCTURES
@@ -32,6 +34,8 @@ pub struct SatBatchData {
     pub incidence_matrix: Vec<f32>,
     // Nhãn [BATCH, MAX_VARS]
     pub targets: Vec<f32>,
+    pub var_mask: Vec<f32>,
+    pub clause_mask: Vec<f32>,
 }
 
 // ==========================================
@@ -43,10 +47,15 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
     loop {
         let mut batch_incidence = vec![0.0; BATCH_SIZE * MAX_CLAUSES * MAX_VARS];
         let mut batch_targets = vec![0.0; BATCH_SIZE * MAX_VARS];
+        let mut batch_var_mask = vec![0.0; BATCH_SIZE * MAX_VARS];
+        let mut batch_clause_mask = vec![0.0; BATCH_SIZE * MAX_CLAUSES];
 
         for b in 0..BATCH_SIZE {
             let n = rng.gen_range(100..=MAX_VARS);
             let m = rng.gen_range(n..=std::cmp::min(8 * n, MAX_CLAUSES));
+
+            for i in 0..n { batch_var_mask[b * MAX_VARS + i] = 1.0; }
+            for j in 0..m { batch_clause_mask[b * MAX_CLAUSES + j] = 1.0; }
 
             // Planted Solution
             let solution: Vec<bool> = (0..n).map(|_| rng.gen_bool(0.5)).collect();
@@ -94,6 +103,8 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
             .send(SatBatchData {
                 incidence_matrix: batch_incidence,
                 targets: batch_targets,
+                var_mask: batch_var_mask,
+                clause_mask: batch_clause_mask,
             })
             .is_err()
         {
@@ -107,6 +118,9 @@ fn run_data_worker(tx: std::sync::mpsc::SyncSender<SatBatchData>) {
 // ==========================================
 #[derive(Module, Debug)]
 pub struct BipartiteSatModel<B: Backend> {
+    var_init: Param<Tensor<B, 1>>,
+    clause_init: Param<Tensor<B, 1>>,
+
     // Các lớp chiếu (Projection) để phân tách Khẳng định/Phủ định
     msg_var_to_pos: Linear<B>,
     msg_var_to_neg: Linear<B>,
@@ -127,6 +141,9 @@ pub struct BipartiteSatModel<B: Backend> {
 impl<B: Backend> BipartiteSatModel<B> {
     pub fn new(device: &B::Device) -> Self {
         Self {
+            var_init: Param::from_tensor(Tensor::random([HIDDEN_DIM], Distribution::Normal(0.0, 0.1), device)),
+            clause_init: Param::from_tensor(Tensor::random([HIDDEN_DIM], Distribution::Normal(0.0, 0.1), device)),
+
             msg_var_to_pos: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
             msg_var_to_neg: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
             msg_clause_to_pos: LinearConfig::new(HIDDEN_DIM, HIDDEN_DIM).init(device),
@@ -145,14 +162,22 @@ impl<B: Backend> BipartiteSatModel<B> {
     pub fn forward(
         &self,
         incidence: Tensor<B, 3>, // [Batch, M, N] chứa 1.0, -1.0, 0.0
+        var_mask: Tensor<B, 2>,
+        clause_mask: Tensor<B, 2>,
     ) -> Tensor<B, 2> {
         let batch_size = incidence.dims()[0];
 
+        let var_mask_3d = var_mask.clone().reshape(Shape::new([batch_size, MAX_VARS, 1]));
+        let clause_mask_3d = clause_mask.clone().reshape(Shape::new([batch_size, MAX_CLAUSES, 1]));
+
         // 1. Khởi tạo TRÍ NHỚ (Memory) cho cả Biến và Ngoặc
-        let mut var_emb =
+        let zeros_v =
             Tensor::<B, 3>::zeros([batch_size, MAX_VARS, HIDDEN_DIM], &incidence.device());
-        let mut clause_emb =
+        let zeros_c =
             Tensor::<B, 3>::zeros([batch_size, MAX_CLAUSES, HIDDEN_DIM], &incidence.device());
+
+        let mut var_emb = (zeros_v + self.var_init.val().reshape(Shape::new([1, 1, HIDDEN_DIM]))) * var_mask_3d.clone();
+        let mut clause_emb = (zeros_c + self.clause_init.val().reshape(Shape::new([1, 1, HIDDEN_DIM]))) * clause_mask_3d.clone();
 
         // 2. Tách ma trận Kép: Nhận diện chính xác 100% Khẳng định và Phủ định
         let pos_mask = relu(incidence.clone()); // Chỉ giữ +1.0
@@ -176,7 +201,7 @@ impl<B: Backend> BipartiteSatModel<B> {
 
             // Cập nhật trí nhớ của Ngoặc (Dùng Residual Connection `+ clause_emb`)
             let clause_update = relu(self.clause_mlp.forward(clause_signals));
-            clause_emb = self.clause_norm.forward(clause_emb + clause_update);
+            clause_emb = self.clause_norm.forward(clause_emb + clause_update) * clause_mask_3d.clone();
 
             // ==========================================
             // BƯỚC B: NGOẶC phản hồi lại BIẾN
@@ -191,12 +216,12 @@ impl<B: Backend> BipartiteSatModel<B> {
 
             // Cập nhật trí nhớ của Biến
             let var_update = relu(self.var_mlp.forward(var_signals));
-            var_emb = self.var_norm.forward(var_emb + var_update);
+            var_emb = self.var_norm.forward(var_emb + var_update) * var_mask_3d.clone();
         }
 
         // 4. Xuất Phổ Logits
         let logits = self.output_layer.forward(var_emb).squeeze(2);
-        logits
+        logits + (var_mask - 1.0) * 10000.0
     }
 }
 
@@ -267,10 +292,15 @@ fn generate_fixed_validation_set(num_samples: usize) -> SatBatchData {
     let mut rng = SmallRng::from_entropy();
     let mut batch_incidence = vec![0.0; num_samples * MAX_CLAUSES * MAX_VARS];
     let mut batch_targets = vec![0.0; num_samples * MAX_VARS];
+    let mut batch_var_mask = vec![0.0; num_samples * MAX_VARS];
+    let mut batch_clause_mask = vec![0.0; num_samples * MAX_CLAUSES];
 
     for b in 0..num_samples {
         let n = rng.gen_range(100..=MAX_VARS);
         let m = rng.gen_range(n..=std::cmp::min(8 * n, MAX_CLAUSES));
+
+        for i in 0..n { batch_var_mask[b * MAX_VARS + i] = 1.0; }
+        for j in 0..m { batch_clause_mask[b * MAX_CLAUSES + j] = 1.0; }
         let solution: Vec<bool> = (0..n).map(|_| rng.gen_bool(0.5)).collect();
 
         for i in 0..n {
@@ -309,12 +339,32 @@ fn generate_fixed_validation_set(num_samples: usize) -> SatBatchData {
     SatBatchData {
         incidence_matrix: batch_incidence,
         targets: batch_targets,
+        var_mask: batch_var_mask,
+        clause_mask: batch_clause_mask,
     }
 }
 
 // ==========================================
 // 6. MAIN LOOP: TRÁI TIM CỦA HỆ THỐNG
 // ==========================================
+fn masked_bce_loss<B: Backend>(
+    logits: Tensor<B, 2>,
+    targets: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let probs = burn::tensor::activation::sigmoid(logits);
+    let eps = 1e-7;
+    let p_safe = probs.clamp_min(eps).clamp_max(1.0 - eps);
+    
+    let term1 = targets.clone() * p_safe.clone().log();
+    let term2 = (targets.neg() + 1.0) * (p_safe.neg() + 1.0).log();
+    let loss_elements = (term1 + term2).neg();
+
+    let masked_loss = loss_elements * mask.clone();
+    
+    masked_loss.sum() / mask.sum().clamp_min(1.0)
+}
+
 fn main() {
     type MyBackend = Autodiff<Wgpu>;
     let device = WgpuDevice::default();
@@ -323,10 +373,7 @@ fn main() {
     let mut model = BipartiteSatModel::<MyBackend>::new(&device);
     let mut optim = AdamConfig::new().init();
 
-    // Khởi tạo Loss function
-    let bce_loss = BinaryCrossEntropyLossConfig::new()
-        .with_logits(true)
-        .init(&device);
+    // Khởi tạo Loss function (đã thay bằng masked_bce_loss custom)
 
     // Tạo Channel Buffer 5 Batches (CPU gen chạy trước, GPU chỉ việc húp)
     let (tx, rx) = sync_channel::<SatBatchData>(5);
@@ -367,9 +414,14 @@ fn main() {
             Tensor::<MyBackend, 1>::from_floats(batch_data.targets.as_slice(), &device)
                 .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
 
+        let var_mask_tensor = Tensor::<MyBackend, 1>::from_floats(batch_data.var_mask.as_slice(), &device)
+            .reshape(Shape::new([BATCH_SIZE, MAX_VARS]));
+        let clause_mask_tensor = Tensor::<MyBackend, 1>::from_floats(batch_data.clause_mask.as_slice(), &device)
+            .reshape(Shape::new([BATCH_SIZE, MAX_CLAUSES]));
+
         // 3. Forward Pass
-        let logits = model.forward(incidence_tensor.clone());
-        let loss = bce_loss.forward(logits.clone(), target_tensor.int());
+        let logits = model.forward(incidence_tensor.clone(), var_mask_tensor.clone(), clause_mask_tensor.clone());
+        let loss = masked_bce_loss(logits, target_tensor, var_mask_tensor);
 
         // 4. Backward Pass & Update Trọng số
         let grads = loss.backward();
@@ -380,8 +432,13 @@ fn main() {
         if iteration % 50 == 0 {
             let loss_val = loss.into_data().value[0];
 
+            let val_var_mask = Tensor::<MyBackend, 1>::from_floats(val_set.var_mask.as_slice(), &device)
+                .reshape(Shape::new([100, MAX_VARS]));
+            let val_clause_mask = Tensor::<MyBackend, 1>::from_floats(val_set.clause_mask.as_slice(), &device)
+                .reshape(Shape::new([100, MAX_CLAUSES]));
+
             // Forward pass lấy phổ trên bộ đề 100 câu
-            let val_logits = model.forward(val_incidence_tensor.clone());
+            let val_logits = model.forward(val_incidence_tensor.clone(), val_var_mask, val_clause_mask);
             let val_probs = sigmoid(val_logits).into_data();
 
             let mut solved_count = 0;
